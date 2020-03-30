@@ -375,39 +375,52 @@ func (s *Service) writeRetentionPolicyInfo(conn net.Conn, database, retentionPol
 }
 
 // readRequest unmarshals a request object from the conn.
-func (s *Service) readRequest(conn net.Conn) (Request, []byte, error) {
+func (s *Service) readRequest(conn net.Conn) (*Request, []byte, error) {
+	// read and decode json request
 	var r Request
 	d := json.NewDecoder(conn)
-
 	if err := d.Decode(&r); err != nil {
-		return r, nil, err
+		return nil, nil, err
 	}
 
-	bits := make([]byte, r.UploadSize+1)
-
-	if r.UploadSize > 0 {
-
-		remainder := d.Buffered()
-
-		n, err := remainder.Read(bits)
-		if err != nil && err != io.EOF {
-			return r, bits, err
-		}
-
-		// it is a bit random but sometimes the Json decoder will consume all the bytes and sometimes
-		// it will leave a few behind.
-		if err != io.EOF && n < int(r.UploadSize+1) {
-			_, err = conn.Read(bits[n:])
-		}
-
-		if err != nil && err != io.EOF {
-			return r, bits, err
-		}
-		// the JSON encoder on the client side seems to write an extra byte, so trim that off the front.
-		return r, bits[1:], nil
+	// we check if UploadSize is less than or equal to zero because it is a
+	// signed int64.  this prevents any kind of buffer overflow that might result
+	// from getting a negative value.
+	if r.UploadSize <= 0 {
+		return &r, nil, nil
 	}
 
-	return r, bits, nil
+	// now we read the remainder of the payload up to r.UploadSize+1.
+	//
+	// we use r.UploadSize+1 because the end of the json message always contains
+	// a newline which r.UploadSize doesn't account for and we always discard.
+	//
+	// FIXME:
+	//
+	// there is a bug lurking here.  the code assumes there is a newline after
+	// the JSON message.  this might not always be the case though so far, it
+	// seems to be.
+	//
+	// we should probably check if the rest of the payload starts with a newline
+	// and re-slice the returned buffer accordingly.
+	//
+	// this would greatly complicate the logic after io.CopyN() below though.
+	//
+	payloadSize := r.UploadSize + 1
+
+	buf := &bytes.Buffer{}
+	buf.Grow(int(payloadSize))
+
+	// copy payloadSize bytes of the remainder of the json buffer and the conn.
+	switch nbytes, err := io.CopyN(buf, io.MultiReader(d.Buffered(), conn), payloadSize); {
+	case err == io.EOF:
+		return nil, nil, fmt.Errorf("read %d of expected %d bytes of request payload", nbytes, payloadSize)
+	case err != nil:
+		return nil, nil, err
+	}
+
+	// return our buffer sans the beginning newline.
+	return &r, buf.Bytes()[1:], nil
 }
 
 // RequestType indicates the typeof snapshot request.
